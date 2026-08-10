@@ -1,0 +1,13 @@
+[build]
+# Railway auto-detects the Dockerfile. Setting builder explicitly ensures
+# it always uses Docker rather than Nixpacks.
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# PORT is injected by Railway at runtime — gunicorn.conf.py reads it.
+# healthcheckPath must respond 200 within healthcheckTimeout seconds.
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
