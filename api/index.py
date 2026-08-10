@@ -31,7 +31,7 @@ try:
 except ImportError:
     pass
 
-from downloader import resolve_link, session, parse_surl, UA, COOKIES_DICT, validate_session_cookie, resolve_tokens_from_cookie, VIDEO_EXTS
+from downloader import resolve_link, close_session, parse_surl, UA, COOKIES_DICT, validate_session_cookie, resolve_tokens_from_cookie, VIDEO_EXTS
 from api.redis_client import redis_client
 from api.account_pool import get_next_healthy_account, mark_account_unhealthy, ACCOUNTS_HASH_KEY, ACTIVE_ACCOUNT_KEY, get_all_accounts
 
@@ -437,7 +437,7 @@ async def lifespan(app: FastAPI):
     
     # Close global HTTP clients cleanly to prevent resource leaks/warnings
     await _proxy_client.aclose()
-    await session.aclose()
+    await close_session()
     if redis_client:
         redis_client.close()
 
@@ -937,7 +937,7 @@ async def _prewarm_quality_cache(link, res):
             async def check_quality(qname, qtype):
                 url = f"{downloader.BASE_API}/api/streaming?{downloader.qp()}&path={encoded_path}&type={qtype}&bdstoken={downloader.BDSTOKEN}"
                 try:
-                    sr = await downloader.session.get(url, timeout=15.0)
+                    sr = await downloader.get_session().get(url, timeout=15.0)
                     if sr.status_code == 200 and "#EXTM3U" in sr.text:
                         return qname, {
                             "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
@@ -1284,7 +1284,7 @@ async def stream_manifest(request: Request):
                         f"&bdstoken={downloader.BDSTOKEN}&isplayer=1&check_blue=1&clienttype=1&resolution={qname}"
                     )
                     try:
-                        sr = await downloader.session.get(url, timeout=15.0)
+                        sr = await downloader.get_session().get(url, timeout=15.0)
                         if sr.status_code == 200 and "#EXTM3U" in sr.text:
                             return qname, {
                                 "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
@@ -1375,7 +1375,7 @@ async def stream_manifest(request: Request):
             f"&bdstoken={downloader.BDSTOKEN}&isplayer=1&check_blue=1&clienttype=1&resolution={quality}"
         )
         
-        sr = await downloader.session.get(url, timeout=20.0)
+        sr = await downloader.get_session().get(url, timeout=20.0)
         if sr.status_code != 200 or "#EXTM3U" not in sr.text:
             return JSONResponse({"status": "error", "message": f"Failed to retrieve stream from Terabox (status={sr.status_code})"}, status_code=500)
 

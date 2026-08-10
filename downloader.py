@@ -7,6 +7,7 @@ import re
 import os
 import zipfile
 import time
+import hashlib
 
 # Load environment variables from .env file if present
 try:
@@ -22,15 +23,12 @@ if sys.version_info >= (3, 7):
 BASE_PUBLIC = "https://www.terabox.com"
 BASE_API    = "https://dm.1024terabox.com"
 
-# Environment variables with hardcoded fallbacks
-JSTOKEN   = os.environ.get("TERABOX_JSTOKEN", "5D29BC1A0FACF3CEB3FD732DA7D673A0FD8AED8B4523E154A3C81F3703E40D5447EFC35BD4572A1A6364FD87651714FD6421FCD4C698998BEFFA5A318A8A07B2")
-BDSTOKEN  = os.environ.get("TERABOX_BDSTOKEN", "dc0d479a8da1268439f4ef3c78000af2")
-LOGID     = os.environ.get("TERABOX_LOGID", "91617900647418900040")
-
-COOKIE = os.environ.get(
-    "TERABOX_COOKIE",
-    "ndus=YQ7FMLNpeHuiFnulqrnbJOzMCEEFsWvghsNdmyUB; PANWEB=1"
-)
+# Credentials must be supplied via the environment or account pool.  TeraBox
+# binds tokens to a session, so source-code fallbacks are both unsafe and stale.
+JSTOKEN  = os.environ.get("TERABOX_JSTOKEN", "")
+BDSTOKEN = os.environ.get("TERABOX_BDSTOKEN", "")
+LOGID    = os.environ.get("TERABOX_LOGID", "")
+COOKIE   = os.environ.get("TERABOX_COOKIE", "")
 
 UA = "dubox;P2SP;2.2.91.249;dubox;4.2.0.1;I2404;android-android;16;JSbridge1.0.10;jointbridge;1.1.39;"
 ROOT_PATH = "/cloudvids"
@@ -47,15 +45,16 @@ def parse_cookies(cookie_str):
 
 def update_credentials(cookie=None, js_token=None, bds_token=None, logid=None):
     """Dynamically update Terabox global cookies and tokens in the session."""
-    global COOKIE, COOKIES_DICT, JSTOKEN, BDSTOKEN, LOGID, session
+    global COOKIE, COOKIES_DICT, JSTOKEN, BDSTOKEN, LOGID
     if cookie:
         COOKIE = cookie
         COOKIES_DICT.clear()
         COOKIES_DICT.update(parse_cookies(cookie))
         # Clear existing cookies in session and update with new ones
-        session.cookies.clear()
+        client = get_session()
+        client.cookies.clear()
         for k, v in COOKIES_DICT.items():
-            session.cookies.set(k, v)
+            client.cookies.set(k, v)
     if js_token:
         JSTOKEN = js_token
     if bds_token:
@@ -136,7 +135,7 @@ async def delete_files_from_account(paths_to_delete, bdstoken_val):
         "filelist": json.dumps(paths_to_delete)
     }
     try:
-        r = await session.post(url, data=payload)
+        r = await get_session().post(url, data=payload)
         res = r.json()
         if res.get("errno") == 0:
             print(f"[TeraBridge] Successfully deleted {len(paths_to_delete)} files in batch to free up space.", flush=True)
@@ -189,6 +188,165 @@ HEADERS = {
 def qp():
     return f"app_id=250528&web=1&channel=dubox&clienttype=0&jsToken={JSTOKEN}&dp-logid={LOGID}"
 
+
+def _new_logid():
+    """Create a request id tied to the current account session."""
+    seed = f"{int(time.time() * 1000)}{COOKIES_DICT.get('ndus', '')[:8]}"
+    return hashlib.md5(seed.encode()).hexdigest().upper()
+
+
+async def refresh_account_tokens():
+    """Refresh account tokens from the authenticated main page.
+
+    The old CLI used baked-in tokens whenever they were non-empty.  TeraBox
+    binds these tokens to a browser session, so a valid ``ndus`` cookie is not
+    enough when those values are stale.
+    """
+    global JSTOKEN, BDSTOKEN, LOGID
+
+    browser_headers = {
+        **HEADERS,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": f"{BASE_API}/",
+    }
+    response = await get_session().get(f"{BASE_API}/main", headers=browser_headers, timeout=20.0)
+    response.raise_for_status()
+    html = response.text
+
+    bds_match = re.search(r'["\']bdstoken["\']?\s*[:=]\s*["\']([^"\']+)', html, re.IGNORECASE)
+    if not bds_match:
+        raise RuntimeError("TeraBox did not return bdstoken; the account cookie may be expired")
+    BDSTOKEN = bds_match.group(1)
+
+    js_match = re.search(r'jsToken\s*=\s*["\']([^"\']+)', html, re.IGNORECASE)
+    if js_match:
+        decoded = urllib.parse.unquote(urllib.parse.unquote(js_match.group(1)))
+        token_match = re.search(r'fn\(["\']([A-Fa-f0-9]{32,})["\']\)', decoded)
+        JSTOKEN = token_match.group(1) if token_match else decoded
+    LOGID = _new_logid()
+
+
+async def resolve_share_session(surl, link):
+    """Get the share token required by ``/share/transfer``.
+
+    ``randsk`` must be supplied both as ``sekey`` and the ``TSID`` cookie.
+    Listing a share can work without it, while copying the share usually does
+    not, which is why the previous flow failed at transfer time.
+    """
+    share_url = link if "://" in link else f"https://{link}"
+    parsed = urllib.parse.urlparse(share_url)
+    bases = [f"{parsed.scheme or 'https'}://{parsed.netloc}", BASE_PUBLIC, BASE_API]
+    try:
+        warmup = await get_session().get(
+            share_url,
+            headers={**HEADERS, "Referer": f"{parsed.scheme or 'https'}://{parsed.netloc}/"},
+            follow_redirects=True,
+            timeout=20.0,
+        )
+        final_base = f"{warmup.url.scheme}://{warmup.url.host}"
+        bases.insert(0, final_base)
+    except httpx.HTTPError:
+        pass
+    seen = set()
+    for base in bases:
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        for shorturl in (surl, f"1{surl}" if not surl.startswith("1") else surl[1:]):
+            params = {
+                "app_id": "250528", "shorturl": shorturl, "root": "1",
+                "web": "1", "channel": "dubox", "clienttype": "0", "jsToken": JSTOKEN,
+            }
+            try:
+                response = await get_session().get(
+                    f"{base}/api/shorturlinfo",
+                    params=params,
+                    headers={**HEADERS, "Referer": f"{base}/"},
+                    follow_redirects=True,
+                    timeout=20.0,
+                )
+                data = response.json()
+            except (httpx.HTTPError, ValueError):
+                continue
+            if data.get("errno") == 0:
+                randsk = urllib.parse.unquote(data.get("randsk", ""))
+                if randsk:
+                    for domain in (parsed.hostname, urllib.parse.urlparse(BASE_API).hostname):
+                        if domain:
+                            get_session().cookies.set("TSID", randsk, domain=domain, path="/")
+                return data
+    return {}
+
+
+async def wait_for_transfer(task_id, bdstoken_val):
+    """Wait until TeraBox confirms an asynchronous share copy completed."""
+    for _ in range(60):
+        response = await get_session().get(
+            f"{BASE_API}/share/taskquery",
+            params={
+                "taskid": str(task_id), "app_id": "250528", "web": "1",
+                "channel": "dubox", "clienttype": "0", "jsToken": JSTOKEN,
+                "bdstoken": bdstoken_val,
+            },
+            timeout=15.0,
+        )
+        result = response.json()
+        status = result.get("status")
+        if status in (2, "success") or (status == -1 and result.get("errno") == 0):
+            return {"errno": 0}
+        if status in (3, "failed") or result.get("errno", 0) not in (0,):
+            return result
+        await asyncio.sleep(2)
+    return {"errno": -1, "errmsg": "Timed out waiting for TeraBox transfer"}
+
+
+async def transfer_shared_file(fs_id, share_id, uk, share_session, bdstoken_val):
+    """Copy one shared file using the share-session-aware transfer contract."""
+    sekey = urllib.parse.unquote(share_session.get("randsk", ""))
+    profiles = [
+        ("12", "terabox;1.40.0.132;PC;PC-Windows;10.0.26100;WindowsTeraBox"),
+        ("0", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+        ("5", "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"),
+    ]
+    last_result = {"errno": -1, "errmsg": "No transfer response"}
+    for clienttype, user_agent in profiles:
+        params = {
+            "app_id": "250528", "web": "1" if clienttype == "0" else "0",
+            "channel": "dubox", "clienttype": clienttype, "jsToken": JSTOKEN,
+            "shareid": str(share_id), "from": str(uk), "sekey": sekey,
+            "ondup": "newcopy", "async": "2", "bdstoken": bdstoken_val,
+            "logid": _new_logid(),
+        }
+        try:
+            response = await get_session().post(
+                f"{BASE_API}/share/transfer",
+                params=params,
+                data={"fsidlist": json.dumps([fs_id]), "path": ROOT_PATH},
+                headers={
+                    **HEADERS, "User-Agent": user_agent, "Referer": f"{BASE_API}/",
+                    "Origin": BASE_API, "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=30.0,
+            )
+            last_result = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            last_result = {"errno": -1, "errmsg": str(exc)}
+
+        if last_result.get("errno") in (0, 4, 12):
+            task_id = last_result.get("task_id")
+            if task_id and last_result.get("errno") == 0:
+                task_result = await wait_for_transfer(task_id, bdstoken_val)
+                if task_result.get("errno") != 0:
+                    return task_result
+            return last_result
+        if last_result.get("errno") not in (400810, 400141, -6):
+            return last_result
+        await asyncio.sleep(0.75)
+        await refresh_account_tokens()
+        bdstoken_val = BDSTOKEN
+    return last_result
+
 def _create_session():
     """Create an httpx.AsyncClient with connection pooling."""
     pool_conn = int(os.environ.get("HTTP_POOL_CONNECTIONS", 50))
@@ -204,7 +362,22 @@ def _create_session():
     )
     return s
 
-session = _create_session()
+_session = None
+
+
+def get_session():
+    """Return the live shared client, recreating it after app shutdown/tests."""
+    global _session
+    if _session is None or _session.is_closed:
+        _session = _create_session()
+    return _session
+
+
+async def close_session():
+    """Close the current client without leaving a permanently closed global."""
+    global _session
+    if _session is not None and not _session.is_closed:
+        await _session.aclose()
 
 _SURL_MIN_LEN = 8     # empirical floor; real Terabox surls are 22-23 chars
 _LEADING_ONE_MAX_STRIPS = 4  # never strip more than this many leading '1' chars
@@ -303,7 +476,7 @@ def show(label, r):
         print(f"  {r.text[:400]}")
         return {}
 
-async def _process_single_file_metadata(item, share_id, uk, existing_files, action, wait_for_transcoding, bdstoken_val, quality=None):
+async def _process_single_file_metadata(item, share_id, uk, share_session, existing_files, action, wait_for_transcoding, bdstoken_val, quality=None):
     """
     Processes a single file from the shared link (transfer + streaming checks).
     This function is run asynchronously.
@@ -345,29 +518,10 @@ async def _process_single_file_metadata(item, share_id, uk, existing_files, acti
         # File exists, skip transfer step
     else:
         # Step A: Transfer
-        transfer_payload = {
-            "fsidlist":  f"[{fs_id}]",
-            "path":      ROOT_PATH,
-            "shareid":   str(share_id),
-            "from":      str(uk),
-            "ondup":     "newcopy",
-            "bdstoken":  bdstoken_val,
-        }
         try:
-            tr = await session.post(
-                f"{BASE_API}/share/transfer?{qp()}&bdstoken={bdstoken_val}",
-                data=transfer_payload
+            transfer_res = await transfer_shared_file(
+                fs_id, share_id, uk, share_session, bdstoken_val
             )
-            transfer_res = tr.json()
-            # If rate-limited/transient check (400810), sleep 1.5s and retry once
-            if transfer_res.get("errno") == 400810:
-                print(f"[TeraBridge] Transfer returned 400810. Retrying in 1.5s...", flush=True)
-                await asyncio.sleep(1.5)
-                tr = await session.post(
-                    f"{BASE_API}/share/transfer?{qp()}&bdstoken={bdstoken_val}",
-                    data=transfer_payload
-                )
-                transfer_res = tr.json()
         except Exception as e:
             file_res["error"] = f"Transfer API request failed: {e}"
             file_res["transfer_status"] = "failed"
@@ -384,15 +538,13 @@ async def _process_single_file_metadata(item, share_id, uk, existing_files, acti
                 "method": "post"
             }
             try:
-                cr = await session.post(create_url, data=create_payload)
+                cr = await get_session().post(create_url, data=create_payload)
                 cr_res = cr.json()
                 if cr_res.get("errno") in (0, -8): # 0 = created, -8 = already exists
                     # Retry transfer
-                    tr = await session.post(
-                        f"{BASE_API}/share/transfer?{qp()}&bdstoken={bdstoken_val}",
-                        data=transfer_payload
+                    transfer_res = await transfer_shared_file(
+                        fs_id, share_id, uk, share_session, BDSTOKEN
                     )
-                    transfer_res = tr.json()
             except Exception as e:
                 print(f"[TeraBridge][WARN] Failed to auto-create directory: {e}", flush=True)
 
@@ -420,7 +572,7 @@ async def _process_single_file_metadata(item, share_id, uk, existing_files, acti
             # Fallback search
             encoded_dir = urllib.parse.quote(ROOT_PATH)
             try:
-                r_list = await session.get(
+                r_list = await get_session().get(
                     f"{BASE_API}/api/list?{qp()}&dir={encoded_dir}&order=time&desc=1&showempty=0&page=1&num=20&bdstoken={bdstoken_val}"
                 )
                 list_res = r_list.json()
@@ -464,7 +616,7 @@ async def _process_single_file_metadata(item, share_id, uk, existing_files, acti
                 f"&bdstoken={bdstoken_val}&isplayer=1&check_blue=1&clienttype=1&resolution={res_val}"
             )
             try:
-                sr = await session.get(url, timeout=20.0)
+                sr = await get_session().get(url, timeout=20.0)
                 if sr.status_code == 200 and "#EXTM3U" in sr.text:
                     return True, 0, sr.text
                 err_code = None
@@ -536,33 +688,28 @@ async def _process_single_file_metadata(item, share_id, uk, existing_files, acti
 
     return file_res
 
+_resolve_lock = asyncio.Lock()
+
+
 async def resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
+    """Serialize account-bound work while credentials live in one session."""
+    async with _resolve_lock:
+        return await _resolve_link(link, action, wait_for_transcoding, quality)
+
+
+async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
     """
     Exposes the core resolution logic.
     Returns a dict with metadata, transfer status, direct links, or streaming playlists.
     """
     global BDSTOKEN, JSTOKEN
     
-    # 1. Fetch current session tokens dynamically if needed
-    if not BDSTOKEN or not JSTOKEN:
-        try:
-            r_main = await session.get(f"{BASE_API}/main", headers=HEADERS)
-            m1 = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r_main.text, re.IGNORECASE)
-            if m1:
-                BDSTOKEN = m1[0]
-            else:
-                m2 = re.search(r'bdstoken\s*=\s*["\']([a-f0-9]{32})["\']', r_main.text)
-                if m2:
-                    BDSTOKEN = m2.group(1)
-
-            m3 = re.findall(r'jstoken["\']?\s*[:=]\s*["\'](.*?)["\']', r_main.text, re.IGNORECASE)
-            if m3:
-                decoded_js = urllib.parse.unquote(m3[0])
-                arg_match = re.search(r'fn\s*\(\s*["\']([a-f0-9]{128})["\']\s*\)', decoded_js, re.IGNORECASE)
-                if arg_match:
-                    JSTOKEN = arg_match.group(1)
-        except Exception as e:
-            return {"errno": -1, "error": f"Failed to resolve session tokens: {e}"}
+    # Tokens are session-bound, so always refresh them instead of trusting
+    # bundled defaults left over from an earlier browser session.
+    try:
+        await refresh_account_tokens()
+    except Exception as e:
+        return {"errno": -1, "error": f"Failed to resolve session tokens: {e}"}
 
     try:
         surl = parse_surl(link)
@@ -573,7 +720,7 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
         f"?app_id=250528&shorturl={surl}&root=1&order=name&desc=0&showempty=0&web=1&page=1&num=100"
     )
     try:
-        r = await session.get(list_url)
+        r = await get_session().get(list_url)
         share_data = r.json()
     except Exception as e:
         return {"errno": -2, "error": f"Failed to query share list: {e}"}
@@ -583,6 +730,8 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
             "errno": share_data.get("errno"),
             "error": f"Share link is invalid or expired (errno={share_data.get('errno')}, msg={share_data.get('errmsg', 'none')}, request_id={share_data.get('request_id', 'none')})."
         }
+
+    share_session = await resolve_share_session(surl, link)
 
     title = share_data.get("title", "Untitled Shared Content")
     share_id = share_data.get("share_id")
@@ -594,7 +743,7 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
     if action != "l":
         encoded_dir = urllib.parse.quote(ROOT_PATH)
         try:
-            r_list = await session.get(
+            r_list = await get_session().get(
                 f"{BASE_API}/api/list?{qp()}&dir={encoded_dir}&order=time&desc=1&showempty=0&page=1&num=1000&bdstoken={BDSTOKEN}"
             )
             list_res = r_list.json()
@@ -612,20 +761,21 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
         except Exception as e:
             print(f"[Pruner][ERROR] Failed to list or prune account files: {e}", flush=True)
 
-    # Run the file metadata/transfer checks in parallel using asyncio.gather
-    tasks = [
-        _process_single_file_metadata(
+    # Transfer requests mutate the same account/session. Serialising them
+    # avoids triggering TeraBox verification when a shared folder is large.
+    results = []
+    for item in files_list:
+        results.append(await _process_single_file_metadata(
             item,
             share_id,
             uk,
+            share_session,
             existing_files,
             action,
             wait_for_transcoding,
             BDSTOKEN,
             quality
-        ) for item in files_list
-    ]
-    results = await asyncio.gather(*tasks)
+        ))
 
     # Batch resolve direct download links (dlink) via filemetas
     # We only query filemetas for successful files (valid fs_id, no error) and when action is not list-only
@@ -644,7 +794,7 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
                 
                 metas_url = f"{BASE_API}/api/filemetas?{qp()}&fsids={encoded_fsids}&dlink=1&thumb=0&bdstoken={BDSTOKEN}"
                 try:
-                    mr = await session.get(metas_url, timeout=20.0)
+                    mr = await get_session().get(metas_url, timeout=20.0)
                     metas_res = mr.json()
                     
                     entries = metas_res.get("list", metas_res.get("info", []))
@@ -680,7 +830,7 @@ async def resolve_link(link, action="d", wait_for_transcoding=False, quality=Non
                 )
                 try:
                     # Request located mirrors with the same session cookies
-                    mr = await session.post(locate_url, content=" =", timeout=15.0)
+                    mr = await get_session().post(locate_url, content=" =", timeout=15.0)
                     if mr.status_code == 200:
                         urls = mr.json().get("urls", [])
                         if urls:
@@ -860,7 +1010,13 @@ async def main():
                 await download_file(dlink, filename)
 
 if __name__ == "__main__":
+    async def run_cli():
+        try:
+            await main()
+        finally:
+            await close_session()
+
     try:
-        asyncio.run(main())
+        asyncio.run(run_cli())
     except KeyboardInterrupt:
         print("\nExiting...")
