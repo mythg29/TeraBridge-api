@@ -126,55 +126,6 @@ async def resolve_tokens_from_cookie(cookie_str):
     except Exception as e:
         raise Exception(f"Failed to resolve tokens from cookie: {str(e)}")
 
-async def delete_files_from_account(paths_to_delete, bdstoken_val):
-    """Programmatically delete a list of files from the account to free up space in a batch."""
-    if not paths_to_delete:
-        return True
-    url = f"{BASE_API}/api/filemanager?opera=delete&async=0&{qp()}&bdstoken={bdstoken_val}"
-    payload = {
-        "filelist": json.dumps(paths_to_delete)
-    }
-    try:
-        r = await get_session().post(url, data=payload)
-        res = r.json()
-        if res.get("errno") == 0:
-            print(f"[TeraBridge] Successfully deleted {len(paths_to_delete)} files in batch to free up space.", flush=True)
-            return True
-        else:
-            print(f"[TeraBridge][WARN] Batch deletion failed: errno {res.get('errno')} for {len(paths_to_delete)} files", flush=True)
-            return False
-    except Exception as e:
-        print(f"[TeraBridge][ERROR] Batch deletion request failed: {e}", flush=True)
-        return False
-
-async def prune_old_files_if_needed(existing_files, bdstoken_val, max_files=50):
-    """
-    If the number of files in ROOT_PATH exceeds max_files, 
-    delete the oldest files to free up space.
-    Modifies existing_files in-place by removing deleted items.
-    """
-    if len(existing_files) <= max_files:
-        return
-    
-    # Sort files by their timestamp (oldest first)
-    sorted_items = sorted(existing_files.items(), key=lambda x: x[1].get("time", 0))
-    to_delete_count = len(existing_files) - max_files
-    to_delete = sorted_items[:to_delete_count]
-    
-    # Batch paths into chunks of 100
-    paths = [f.get("path") for name, f in to_delete if f.get("path")]
-    chunk_size = 100
-    chunks = [paths[i:i + chunk_size] for i in range(0, len(paths), chunk_size)]
-    
-    print(f"[TeraBridge] Pruning {to_delete_count} oldest files from account storage in {len(chunks)} batch(es) to stay within limits...", flush=True)
-    for chunk in chunks:
-        success = await delete_files_from_account(chunk, bdstoken_val)
-        if success:
-            chunk_set = set(chunk)
-            to_remove = [name for name, f in existing_files.items() if f.get("path") in chunk_set]
-            for name in to_remove:
-                existing_files.pop(name, None)
-
 COOKIES_DICT = parse_cookies(COOKIE)
 
 HEADERS = {
@@ -756,10 +707,8 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                         "size": int(entry.get("size", 0)),
                         "time": int(entry.get("server_mtime") or entry.get("ctime") or 0)
                     }
-                # Keep at most 50 files per account to stay within storage limits
-                await prune_old_files_if_needed(existing_files, BDSTOKEN, max_files=50)
         except Exception as e:
-            print(f"[Pruner][ERROR] Failed to list or prune account files: {e}", flush=True)
+            print(f"[TeraBridge][WARN] Failed to list existing account files: {e}", flush=True)
 
     # Transfer requests mutate the same account/session. Serialising them
     # avoids triggering TeraBox verification when a shared folder is large.
