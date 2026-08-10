@@ -6,7 +6,9 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 # PORT is injected by Railway at runtime — gunicorn.conf.py reads it.
-# healthcheckPath must respond 200 within healthcheckTimeout seconds.
+# startCommand overrides any auto-detected command from other config files
+# (e.g. render.yaml) and ensures the Dockerfile CMD is not shadowed.
+startCommand = "gunicorn --config gunicorn.conf.py api.index:app"
 healthcheckPath = "/"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
