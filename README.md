@@ -1,6 +1,6 @@
 # TeraBridge API
 
-A lightweight, modular Python API and CLI utility for retrieving direct download links and playable HLS `.m3u8` streaming manifests from Terabox shared folders. Built on **FastAPI** with fully asynchronous I/O (`httpx` + `asyncio`), it is designed for high concurrency and can be deployed to **Render** (free plan), **Docker**, or **Vercel**.
+A lightweight, modular Python API and CLI utility for retrieving direct download links and playable HLS `.m3u8` streaming manifests from Terabox shared folders. Built on **FastAPI** with fully asynchronous I/O (`httpx` + `asyncio`), it is designed for high concurrency and can be deployed to **Railway**, **Render** (free plan), **Docker**, or **Vercel**.
 
 ---
 
@@ -10,6 +10,7 @@ A lightweight, modular Python API and CLI utility for retrieving direct download
 - **Dynamic Token Resolution:** Automatically resolves session-specific `bdstoken` and `jsToken` dynamically from your cookies to bypass standard verification blocks.
 - **Save Location Targeting:** Copies shared files automatically to a `/cloudvids` folder inside the account storage for clear organization.
 - **HLS Transcoding Handling:** Automatically handles transcoding ready delays (`errno: 130`). For serverless executions, it flags this state cleanly in the JSON response, enabling clients to poll/retry.
+- **Railway Deployable:** Deploy via Docker in one click with `railway.toml` included — auto-detects the Dockerfile, configures health checks, and reads `PORT` from Railway's injected environment.
 - **Render Deployable:** One-click deploy on Render's free plan via `render.yaml` Blueprint, with auto-generated secrets and free-plan tuning built in.
 - **Vercel Deployable:** Designed out-of-the-box for quick deployment using the Vercel Python runtime.
 - **Response Caching:** In-memory LRU cache (or Upstash Redis) with configurable TTL (default 60s) reduces redundant Terabox API calls for repeated links.
@@ -25,7 +26,7 @@ A lightweight, modular Python API and CLI utility for retrieving direct download
 
 Deploy this API directly to your platform of choice with a single click:
 
-[![Deploy to Vercel](https://img.shields.io/badge/Deploy_to-Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsaahiyo-cloud%2FTeraBridge-api&env=API_KEY,UPSTASH_REDIS_REST_URL,UPSTASH_REDIS_REST_TOKEN,CRON_SECRET) [![Deploy to Render](https://img.shields.io/badge/Deploy_to-Render-4613B1?style=for-the-badge&logo=render&logoColor=white)](https://render.com/deploy?repo=https://github.com/saahiyo-cloud/TeraBridge-api)
+[![Deploy to Railway](https://img.shields.io/badge/Deploy_to-Railway-0B0D0E?style=for-the-badge&logo=railway&logoColor=white)](https://railway.app/new/template?template=https://github.com/saahiyo-cloud/TeraBridge-api) [![Deploy to Vercel](https://img.shields.io/badge/Deploy_to-Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fsaahiyo-cloud%2FTeraBridge-api&env=API_KEY,UPSTASH_REDIS_REST_URL,UPSTASH_REDIS_REST_TOKEN,CRON_SECRET) [![Deploy to Render](https://img.shields.io/badge/Deploy_to-Render-4613B1?style=for-the-badge&logo=render&logoColor=white)](https://render.com/deploy?repo=https://github.com/saahiyo-cloud/TeraBridge-api)
 
 ---
 
@@ -43,6 +44,7 @@ terabridge-api/
 ├── Dockerfile                # Multi-stage Docker build
 ├── docker-compose.yml        # Docker Compose for local development
 ├── render.yaml               # Render.com Blueprint (free plan defaults)
+├── railway.toml              # Railway deployment config (Docker builder + health check)
 ├── requirements.txt          # Python dependencies
 ├── vercel.json               # Vercel deployment rewrites config
 └── README.md                 # This documentation
@@ -282,7 +284,40 @@ Results include latency percentiles (min/avg/median/p90/p95/p99/max), throughput
 
 ---
 
-## 4. Vercel Deployment
+## 4. Railway Deployment
+
+Railway uses the included `railway.toml` and `Dockerfile` — no extra setup needed.
+
+### Quick Deploy
+
+1. Push the repo to GitHub.
+2. Go to [railway.app](https://railway.app) → **New Project → Deploy from GitHub repo** → select this repo.
+3. Railway auto-detects the Dockerfile and `railway.toml`.
+4. Open the service → **Variables** tab and add your environment variables:
+
+   | Variable | Description |
+   |---|---|
+   | `TERABOX_COOKIE` | Full raw cookie string from browser DevTools (`ndus=...` is the minimum required) |
+   | `API_KEY` | Your secret API key for securing endpoints |
+   | `REQUIRE_API_KEY` | Set to `1` to enforce authentication |
+   | `REDIRECT_SEGMENTS` | Set to `true` to 307-redirect segments to CDN (recommended — cuts egress ~90%) |
+   | `UPSTASH_REDIS_REST_URL` | *(Optional)* Upstash Redis URL for persistent caching and rate limiting |
+   | `UPSTASH_REDIS_REST_TOKEN` | *(Optional)* Upstash Redis token |
+
+5. Railway deploys automatically. The health check hits `/` every 15 seconds (configured in `railway.toml`).
+
+> `PORT` is injected automatically by Railway — no manual configuration needed.
+
+### Platform Notes — Railway
+
+- Railway runs the app as a Docker container using Gunicorn + UvicornWorker (configured in `gunicorn.conf.py`). Worker count scales with CPU cores.
+- The app is always-on (no spin-down) unlike Render's free plan, so no keep-alive pings are needed.
+- Railway's free tier includes a **$5/month credit**. Since this app proxies large file streams, setting `REDIRECT_SEGMENTS=true` is strongly recommended to minimise egress costs.
+- For accurate client IP resolution behind Railway's proxy, no extra config is needed — loopback addresses are trusted automatically. If you add a custom domain with Cloudflare or another CDN in front, add its CIDR to `TRUSTED_PROXIES`.
+
+---
+
+## 5. Vercel Deployment
 
 Deploy the API globally to Vercel in seconds:
 
@@ -301,7 +336,7 @@ Deploy the API globally to Vercel in seconds:
 
 ---
 
-## 5. Render.com Deployment (Free Plan)
+## 6. Render.com Deployment (Free Plan)
 
 The repo includes a [`render.yaml`](render.yaml) Blueprint with free-plan defaults pre-configured — one-click deploy with no manual setup.
 
@@ -361,7 +396,7 @@ If you prefer to create the service by hand:
 
 ---
 
-## 6. Docker Deployment
+## 7. Docker Deployment
 
 ```bash
 # Build and run with Docker Compose
