@@ -14,6 +14,14 @@ import re
 from collections import OrderedDict
 import logging
 
+# ─── Logger setup ────────────────────────────────────────────────────
+logger = logging.getLogger("terabridge.api")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
 # Add the project root directory to sys.path to resolve downloader module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -119,7 +127,7 @@ def _parse_trusted_cidrs(raw):
         try:
             cidrs.append(ipaddress.ip_network(entry, strict=False))
         except ValueError as e:
-            print(f"[TeraBridge][WARN] Ignoring invalid TRUSTED_PROXIES entry {entry!r}: {e}")
+            logger.warning("Ignoring invalid TRUSTED_PROXIES entry %r: %s", entry, e)
     return cidrs
 
 TRUSTED_PROXY_CIDRS = _parse_trusted_cidrs(TRUSTED_PROXY_CIDRS_RAW)
@@ -241,7 +249,7 @@ class ResponseCache:
                         pass
                     return None
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis get error: {e}", flush=True)
+                logger.warning("Upstash Redis get error: %s", e)
 
         if key in self._store:
             data, ts = self._store[key]
@@ -262,7 +270,7 @@ class ResponseCache:
                 self.redis_client.set(redis_key, json.dumps(response), ex=self._ttl)
                 return
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis put error: {e}", flush=True)
+                logger.warning("Upstash Redis put error: %s", e)
 
         if key in self._store:
             del self._store[key]
@@ -291,7 +299,7 @@ class ResponseCache:
                     "hit_rate": f"{(redis_hits / total * 100):.1f}%" if total > 0 else "N/A",
                 }
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis stats error: {e}", flush=True)
+                logger.warning("Upstash Redis stats error: %s", e)
         
         total = self.hits + self.misses
         return {
@@ -336,7 +344,7 @@ class RateLimiter:
                     return False
                 return True
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis rate limit check error: {e}", flush=True)
+                logger.warning("Upstash Redis rate limit check error: %s", e)
 
         if ip not in self._requests:
             self._requests[ip] = []
@@ -364,7 +372,7 @@ class RateLimiter:
                 count = int(res[1])
                 return max(0, self._max - count)
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis rate limit remaining error: {e}", flush=True)
+                logger.warning("Upstash Redis rate limit remaining error: %s", e)
 
         if ip not in self._requests:
             return self._max
@@ -388,7 +396,7 @@ class RateLimiter:
                     "total_blocked": blocked,
                 }
             except Exception as e:
-                print(f"[TeraBridge][WARN] Upstash Redis rate limit stats error: {e}", flush=True)
+                logger.warning("Upstash Redis rate limit stats error: %s", e)
 
         now = time.time()
         active_ips = sum(
@@ -467,7 +475,7 @@ async def get_google_public_keys():
                         max_age = int(match.group(1))
                     _keys_expiry = now + max_age
         except Exception as e:
-            print(f"[TeraBridge][ERROR] Failed to fetch Google public keys: {e}", flush=True)
+            logger.error("Failed to fetch Google public keys: %s", e)
     return _google_public_keys
 
 async def verify_firebase_token(request: Request, token):
@@ -482,7 +490,7 @@ async def verify_firebase_token(request: Request, token):
         public_key = public_keys.get(kid)
         if not public_key:
             err_msg = f"Public key for kid '{kid}' not found."
-            print(f"[Auth][ERROR] {err_msg}", flush=True)
+            logger.error("[Auth] %s", err_msg)
             _recent_auth_errors.append({
                 "timestamp": time.time(),
                 "error": err_msg
@@ -507,7 +515,7 @@ async def verify_firebase_token(request: Request, token):
     except Exception as e:
         import traceback
         err_msg = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"[Auth][ERROR] Firebase JWT verification failed: {err_msg}", flush=True)
+        logger.error("[Auth] Firebase JWT verification failed: %s", err_msg)
         _recent_auth_errors.append({
             "timestamp": time.time(),
             "error": str(e),
@@ -646,7 +654,7 @@ def get_user_tier(request: Request = None):
                     _user_tier_cache[uid] = (cached_tier, now + USER_TIER_CACHE_TTL)
                 return cached_tier
         except Exception as e:
-            print(f"[TeraBridge][WARN] Redis user tier cache get error: {e}", flush=True)
+            logger.warning("Redis user tier cache get error: %s", e)
 
     token = getattr(request.state, "firebase_token", None)
     if token:
@@ -670,11 +678,11 @@ def get_user_tier(request: Request = None):
                         redis_key = f"user:tier:{uid}"
                         redis_client.set(redis_key, resolved_tier, ex=USER_TIER_CACHE_TTL)
                     except Exception as e:
-                        print(f"[TeraBridge][WARN] Redis user tier cache set error: {e}", flush=True)
+                        logger.warning("Redis user tier cache set error: %s", e)
 
                 return resolved_tier
         except Exception as e:
-            print(f"[TeraBridge][WARN] Failed to fetch user tier from Firebase DB: {e}", flush=True)
+            logger.warning("Failed to fetch user tier from Firebase DB: %s", e)
 
     return "free"
 
@@ -716,8 +724,10 @@ def verify_signature(param1, param2, param3, signature, exp=""):
 
     expected_legacy = generate_signature(param1, param2, param3, "")
     if expected_legacy and hmac.compare_digest(expected_legacy, signature):
-        print("[TeraBridge][WARN] Accepted legacy un-expiring signed URL "
-              f"(p1={param1[:24]}...). Consider re-resolving to refresh.", flush=True)
+        logger.warning(
+            "Accepted legacy un-expiring signed URL (p1=%s...). Consider re-resolving to refresh.",
+            param1[:24],
+        )
         return True
     return False
 
@@ -826,20 +836,20 @@ async def resolve_link_with_retry(link, action="d", wait_for_transcoding=False, 
                     is_transient_rotation = True
                     
         if is_account_error and active_id:
-            print(f"[TeraBridge] Account '{active_id}' hit account-level failure: {reason}. Marking UNHEALTHY.", flush=True)
+            logger.warning("Account '%s' hit account-level failure: %s. Marking UNHEALTHY.", active_id, reason)
             mark_account_unhealthy(active_id, reason)
             # Rotate config
             load_config_from_redis()
             if attempt < max_retries - 1:
-                print(f"[TeraBridge] Retrying resolution using rotated account: {_current_active_account_id}", flush=True)
+                logger.info("Retrying resolution using rotated account: %s", _current_active_account_id)
                 continue
         elif is_transient_rotation and active_id:
-            print(f"[TeraBridge] Account '{active_id}' hit transient limit: {reason}. Rotating to another healthy account...", flush=True)
+            logger.warning("Account '%s' hit transient limit: %s. Rotating to another healthy account...", active_id, reason)
             # Force rotation to next healthy account in pool
             get_next_healthy_account()
             load_config_from_redis()
             if attempt < max_retries - 1:
-                print(f"[TeraBridge] Retrying resolution using rotated account: {_current_active_account_id}", flush=True)
+                logger.info("Retrying resolution using rotated account: %s", _current_active_account_id)
                 continue
                 
         break
@@ -943,7 +953,7 @@ async def _prewarm_quality_cache(link, res):
                             "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
                         }
                 except Exception as e:
-                    print(f"[PreWarm][ERROR] Quality {qname}: {e}", flush=True)
+                    logger.error("[PreWarm] Quality %s check failed: %s", qname, e)
                 return qname, None
 
             tasks = [check_quality(qname, qtype) for qname, qtype in qualities_to_check.items()]
@@ -959,15 +969,15 @@ async def _prewarm_quality_cache(link, res):
                         redis_key = f"cache:response:{key}"
                         redis_client.set(redis_key, json.dumps(ready_qualities), ex=86400)
                     except Exception as e:
-                        print(f"[PreWarm][WARN] Redis cache save error: {e}", flush=True)
+                        logger.warning("[PreWarm] Redis cache save error: %s", e)
                 else:
                     cache.put(link, f"qualities:{file_index}", False, ready_qualities)
-                print(f"[PreWarm] Cached qualities for file {file_index}: {list(ready_qualities.keys())}", flush=True)
+                logger.info("[PreWarm] Cached qualities for file %d: %s", file_index, list(ready_qualities.keys()))
             else:
-                print(f"[PreWarm] No streamable qualities found for file {file_index}", flush=True)
+                logger.info("[PreWarm] No streamable qualities found for file %d", file_index)
 
     except Exception as e:
-        print(f"[PreWarm][ERROR] Background quality pre-warm failed: {e}", flush=True)
+        logger.error("[PreWarm] Background quality pre-warm failed: %s", e)
 
 # ─── Single Flight (Request Collapsing) locks ────────────────────────
 _single_flight_events = {}
@@ -979,7 +989,7 @@ def acquire_resolve_lock(key):
             is_locked = redis_client.set(f"lock:resolve:{key}", "locked", nx=True, ex=30)
             return bool(is_locked)
         except Exception as e:
-            print(f"[SingleFlight][WARN] Redis lock set error: {e}", flush=True)
+            logger.warning("[SingleFlight] Redis lock set error: %s", e)
             
     with _single_flight_lock:
         if key in _single_flight_events:
@@ -992,7 +1002,7 @@ def release_resolve_lock(key):
         try:
             redis_client.delete(f"lock:resolve:{key}")
         except Exception as e:
-            print(f"[SingleFlight][WARN] Redis lock delete error: {e}", flush=True)
+            logger.warning("[SingleFlight] Redis lock delete error: %s", e)
             
     with _single_flight_lock:
         if key in _single_flight_events:
@@ -1040,7 +1050,7 @@ async def _background_transcode_poll(link, action, cache_key):
                 return
             _active_transcode_jobs.add(cache_key)
 
-    print(f"[TranscoderWorker] Starting background transcoding checks for: {link}", flush=True)
+    logger.info("[TranscoderWorker] Starting background transcoding checks for: %s", link)
     try:
         res = await resolve_link_with_retry(link, action=action, wait_for_transcoding=True)
         if res.get("errno") == 0:
@@ -1054,12 +1064,12 @@ async def _background_transcode_poll(link, action, cache_key):
                 video_title = res.get("title", "Unknown Video")
                 alert_msg = f"🎉 **HLS Transcoding Complete!**\nVideo **{video_title}** has finished transcoding and is ready for streaming."
                 await send_webhook_alert(alert_msg)
-                print(f"[TranscoderWorker] Success: transcoding complete for: {link}", flush=True)
+                logger.info("[TranscoderWorker] Success: transcoding complete for: %s", link)
                 return
                 
-        print(f"[TranscoderWorker] Finished polling, but transcoding is still incomplete for: {link}", flush=True)
+        logger.info("[TranscoderWorker] Finished polling, transcoding still incomplete for: %s", link)
     except Exception as e:
-        print(f"[TranscoderWorker][ERROR] Exception during background transcode: {e}", flush=True)
+        logger.error("[TranscoderWorker] Exception during background transcode: %s", e)
     finally:
         if redis_client:
             try:
@@ -1133,14 +1143,14 @@ async def resolve(request: Request):
     has_lock = acquire_resolve_lock(cache_key)
     
     if not has_lock:
-        print(f"[SingleFlight] Waiting for concurrent resolution of: {link}", flush=True)
+        logger.info("[SingleFlight] Waiting for concurrent resolution of: %s", link)
         cached = await wait_for_resolution(cache_key, lambda: cache.get(link, action, wait_for_transcoding), timeout=30)
         if cached is not None:
             return JSONResponse(cached, headers={
                 "X-Cache": "HIT (COLLAPSED)",
                 "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))
             })
-        print(f"[SingleFlight] Wait timed out, proceeding to resolve ourselves: {link}", flush=True)
+        logger.info("[SingleFlight] Wait timed out, proceeding to resolve ourselves: %s", link)
         acquire_resolve_lock(cache_key)
 
     try:
@@ -1239,9 +1249,9 @@ async def stream_manifest(request: Request):
         if not quality:
             ready_qualities = cache.get(link, f"qualities:{file_index}", False)
             if ready_qualities:
-                print(f"[Manifest] Cache HIT for available qualities: {link} -> {list(ready_qualities.keys())}", flush=True)
+                logger.debug("[Manifest] Cache HIT for available qualities: %s -> %s", link, list(ready_qualities.keys()))
             else:
-                print(f"[Manifest] Cache MISS for available qualities: {link}. Resolving...", flush=True)
+                logger.info("[Manifest] Cache MISS for available qualities: %s. Resolving...", link)
                 res = await resolve_link_with_retry(link, action="s", wait_for_transcoding=wait_for_transcoding)
                 if res.get("errno") != 0:
                     return JSONResponse({"status": "error", "message": res.get("error", "Unknown resolution error occurred.")}, status_code=400)
@@ -1290,7 +1300,7 @@ async def stream_manifest(request: Request):
                                 "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
                             }
                     except Exception as e:
-                        print(f"[Manifest][ERROR] Failed to check quality {qname}: {e}", flush=True)
+                        logger.error("[Manifest] Failed to check quality %s: %s", qname, e)
                     return qname, None
 
                 tasks = [check_streaming_quality(qname, qtype) for qname, qtype in qualities_to_check.items()]
@@ -1312,7 +1322,7 @@ async def stream_manifest(request: Request):
                         ttl = 86400 if not is_transcoding else 120
                         redis_client.set(redis_key, json.dumps(ready_qualities), ex=ttl)
                     except Exception as e:
-                        print(f"[Manifest][WARN] Redis cache save error: {e}", flush=True)
+                        logger.warning("[Manifest] Redis cache save error: %s", e)
                 else:
                     cache.put(link, f"qualities:{file_index}", False, ready_qualities)
 
@@ -1712,9 +1722,9 @@ def load_config_from_redis():
                 bds_token=creds.get("bds_token"),
                 logid=creds.get("logid")
             )
-            print(f"[TeraBridge] Successfully synchronized active pool account: {active_id}", flush=True)
+            logger.info("Successfully synchronized active pool account: %s", active_id)
     except Exception as e:
-        print(f"[TeraBridge][WARN] Failed to load config from Upstash Redis pool: {e}", flush=True)
+        logger.warning("Failed to load config from Upstash Redis pool: %s", e)
 
 # Load initial config on startup
 load_config_from_redis()
@@ -1881,7 +1891,7 @@ async def send_webhook_alert(message):
         async with httpx.AsyncClient() as client:
             await client.post(NOTIFICATION_WEBHOOK_URL, json=payload, timeout=10.0)
     except Exception as e:
-        print(f"[TeraBridge][WARN] Failed to send webhook alert: {e}", flush=True)
+        logger.warning("Failed to send webhook alert: %s", e)
 
 @app.api_route("/api/cron/validate", methods=["GET", "POST"])
 async def cron_validate(request: Request):
@@ -1940,7 +1950,7 @@ async def cron_validate(request: Request):
                 load_config_from_redis()
                 
         except Exception as e:
-            print(f"[TeraBridge][WARN] Failed to run cron accounts check: {e}", flush=True)
+            logger.warning("Failed to run cron accounts check: %s", e)
             
     else:
         # Fallback to local default cookie if Redis is not configured
@@ -1965,7 +1975,7 @@ async def cron_validate(request: Request):
         try:
             redis_client.hset("terabridge:status", values=status_data)
         except Exception as e:
-            print(f"[TeraBridge][WARN] Failed to write status to Redis in cron: {e}", flush=True)
+            logger.warning("Failed to write status to Redis in cron: %s", e)
 
     return {
         "status": "success",
@@ -1977,10 +1987,12 @@ async def cron_validate(request: Request):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5000))
-    print(f"[TeraBridge] Cache TTL: {CACHE_TTL_SECONDS}s | Rate limit: {RATE_LIMIT_RPM} req/min")
+    logger.info("Cache TTL: %ds | Rate limit: %d req/min", CACHE_TTL_SECONDS, RATE_LIMIT_RPM)
     if not API_KEY and not REQUIRE_API_KEY:
-        print("[TeraBridge][WARNING] API_KEY is not set and REQUIRE_API_KEY is disabled — "
-              "all endpoints are currently OPEN (no authentication). Do not expose this "
-              "instance to the public internet.", flush=True)
-    print(f"[TeraBridge] Starting Uvicorn async server on 0.0.0.0:{port}")
+        logger.warning(
+            "API_KEY is not set and REQUIRE_API_KEY is disabled — "
+            "all endpoints are currently OPEN (no authentication). "
+            "Do not expose this instance to the public internet."
+        )
+    logger.info("Starting Uvicorn async server on 0.0.0.0:%d", port)
     uvicorn.run("api.index:app", host="0.0.0.0", port=port, reload=False, workers=1)

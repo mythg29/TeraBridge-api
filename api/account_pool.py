@@ -1,6 +1,9 @@
 import json
+import logging
 import time
 from api.redis_client import redis_client
+
+logger = logging.getLogger("terabridge.account_pool")
 
 ACCOUNTS_HASH_KEY = "terabridge:accounts"
 ACTIVE_ACCOUNT_KEY = "terabridge:active_account_id"
@@ -19,7 +22,7 @@ def get_all_accounts():
                 pass
         return accounts
     except Exception as e:
-        print(f"[AccountPool][ERROR] Failed to fetch accounts from Redis: {e}", flush=True)
+        logger.error("Failed to fetch accounts from Redis: %s", e)
         return {}
 
 def get_next_healthy_account():
@@ -38,7 +41,7 @@ def get_next_healthy_account():
         }
 
         if not healthy_accounts:
-            print("[AccountPool][ERROR] No healthy accounts available in the pool!", flush=True)
+            logger.error("No healthy accounts available in the pool!")
             return None, None
 
         # Sort by last_used timestamp to round-robin
@@ -51,11 +54,10 @@ def get_next_healthy_account():
         
         # Store active account ID
         redis_client.set(ACTIVE_ACCOUNT_KEY, selected_id)
-        print(f"[AccountPool] Rotated and selected healthy account: {selected_id}", flush=True)
-
+        logger.info("Rotated and selected healthy account: %s", selected_id)
         return selected_id, selected_data
     except Exception as e:
-        print(f"[AccountPool][ERROR] Error selecting next healthy account: {e}", flush=True)
+        logger.error("Error selecting next healthy account: %s", e)
         return None, None
 
 def mark_account_unhealthy(account_id, reason="unknown"):
@@ -71,6 +73,6 @@ def mark_account_unhealthy(account_id, reason="unknown"):
             data["unhealthy_reason"] = reason
             data["unhealthy_at"] = int(time.time())
             redis_client.hset(ACCOUNTS_HASH_KEY, account_id, json.dumps(data))
-            print(f"[AccountPool] Account '{account_id}' marked UNHEALTHY. Reason: {reason}", flush=True)
+            logger.warning("Account '%s' marked UNHEALTHY. Reason: %s", account_id, reason)
     except Exception as e:
-        print(f"[AccountPool][ERROR] Failed to mark account {account_id} unhealthy: {e}", flush=True)
+        logger.error("Failed to mark account %s unhealthy: %s", account_id, e)

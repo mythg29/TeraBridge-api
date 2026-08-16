@@ -1,5 +1,8 @@
 import os
+import logging
 from upstash_redis import Redis
+
+logger = logging.getLogger("terabridge.redis")
 
 # Try loading env in case it is imported standalone
 try:
@@ -15,13 +18,11 @@ redis_client = None
 
 if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
     try:
-        # Initialize Upstash Redis client
         redis_client = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-        # Verify connection
         redis_client.ping()
-        print("[TeraBridge] Successfully connected to Upstash Redis!", flush=True)
+        logger.info("Successfully connected to Upstash Redis.")
     except Exception as e:
-        print(f"[TeraBridge][ERROR] Failed to initialize Upstash Redis: {e}", flush=True)
+        logger.error("Failed to initialize Upstash Redis: %s", e)
         redis_client = None
 else:
-    print("[TeraBridge] Upstash Redis credentials not detected. Caching and Rate Limiting will fall back to local in-memory.", flush=True)
+    logger.info("Upstash Redis credentials not detected. Caching and Rate Limiting will use local in-memory.")

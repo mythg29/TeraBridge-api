@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import json
+import logging
 import urllib.parse
 import sys
 import re
@@ -19,6 +20,14 @@ except ImportError:
 # Set stdout encoding to UTF-8 to prevent UnicodeEncodeError on Windows
 if sys.version_info >= (3, 7):
     sys.stdout.reconfigure(encoding='utf-8')
+
+# ─── Logger setup ────────────────────────────────────────────────────
+logger = logging.getLogger("terabridge.downloader")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
 BASE_PUBLIC = "https://www.terabox.com"
 BASE_API    = "https://dm.1024terabox.com"
@@ -121,7 +130,7 @@ async def resolve_tokens_from_cookie(cookie_str):
             if not resolved.get("bds_token"):
                 raise Exception("bdstoken not found — cookie is likely expired or invalid")
             
-            print(f"[TeraBridge] Auto-resolved tokens: {list(resolved.keys())}", flush=True)
+            logger.info("Auto-resolved tokens: %s", list(resolved.keys()))
             return resolved
     except Exception as e:
         raise Exception(f"Failed to resolve tokens from cookie: {str(e)}")
@@ -149,9 +158,9 @@ def _new_logid():
 async def refresh_account_tokens():
     """Refresh account tokens from the authenticated main page.
 
-    The old CLI used baked-in tokens whenever they were non-empty.  TeraBox
-    binds these tokens to a browser session, so a valid ``ndus`` cookie is not
-    enough when those values are stale.
+    Returns a (bdstoken, jstoken, logid) tuple so callers can use them as
+    local variables instead of relying on shared globals. This eliminates the
+    need to serialize concurrent requests through a global lock.
     """
     global JSTOKEN, BDSTOKEN, LOGID
 
@@ -168,14 +177,23 @@ async def refresh_account_tokens():
     bds_match = re.search(r'["\']bdstoken["\']?\s*[:=]\s*["\']([^"\']+)', html, re.IGNORECASE)
     if not bds_match:
         raise RuntimeError("TeraBox did not return bdstoken; the account cookie may be expired")
-    BDSTOKEN = bds_match.group(1)
+    bdstoken = bds_match.group(1)
 
+    jstoken = JSTOKEN  # keep existing if not found
     js_match = re.search(r'jsToken\s*=\s*["\']([^"\']+)', html, re.IGNORECASE)
     if js_match:
         decoded = urllib.parse.unquote(urllib.parse.unquote(js_match.group(1)))
         token_match = re.search(r'fn\(["\']([A-Fa-f0-9]{32,})["\']\)', decoded)
-        JSTOKEN = token_match.group(1) if token_match else decoded
-    LOGID = _new_logid()
+        jstoken = token_match.group(1) if token_match else decoded
+
+    logid = _new_logid()
+
+    # Also update globals so other callers (e.g. qp()) stay in sync
+    BDSTOKEN = bdstoken
+    JSTOKEN = jstoken
+    LOGID = logid
+
+    return bdstoken, jstoken, logid
 
 
 async def resolve_share_session(surl, link):
@@ -497,7 +515,7 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
                         fs_id, share_id, uk, share_session, BDSTOKEN
                     )
             except Exception as e:
-                print(f"[TeraBridge][WARN] Failed to auto-create directory: {e}", flush=True)
+                logger.warning("Failed to auto-create directory: %s", e)
 
         if transfer_res.get("errno") not in (0, 4):
             file_res["error"] = f"Transfer failed with Terabox errno {transfer_res.get('errno')}"
@@ -619,7 +637,7 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
             # PASS 2: All resolutions are still transcoding — wait and retry
             max_retries = 12
             retry_delay = 10
-            print(f"  ⏳ All resolutions still transcoding, waiting (up to {max_retries * retry_delay}s)...")
+            logger.info("All resolutions still transcoding, waiting (up to %ds)...", max_retries * retry_delay)
             for attempt in range(1, max_retries + 1):
                 await asyncio.sleep(retry_delay)
                 # Retry all types each round (highest first)
@@ -643,9 +661,13 @@ _resolve_lock = asyncio.Lock()
 
 
 async def resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
-    """Serialize account-bound work while credentials live in one session."""
-    async with _resolve_lock:
-        return await _resolve_link(link, action, wait_for_transcoding, quality)
+    """Dispatch resolution without a global lock.
+
+    Tokens are refreshed locally inside each call, so concurrent requests for
+    different links are fully parallel. The single-flight / request-collapsing
+    logic in index.py deduplicates requests for the *same* link.
+    """
+    return await _resolve_link(link, action, wait_for_transcoding, quality)
 
 
 async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
@@ -653,12 +675,10 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
     Exposes the core resolution logic.
     Returns a dict with metadata, transfer status, direct links, or streaming playlists.
     """
-    global BDSTOKEN, JSTOKEN
-    
-    # Tokens are session-bound, so always refresh them instead of trusting
-    # bundled defaults left over from an earlier browser session.
+    # Refresh tokens for this request — returns local copies so concurrent
+    # calls don't stomp each other's globals mid-request.
     try:
-        await refresh_account_tokens()
+        bdstoken, jstoken, _ = await refresh_account_tokens()
     except Exception as e:
         return {"errno": -1, "error": f"Failed to resolve session tokens: {e}"}
 
@@ -695,7 +715,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
         encoded_dir = urllib.parse.quote(ROOT_PATH)
         try:
             r_list = await get_session().get(
-                f"{BASE_API}/api/list?{qp()}&dir={encoded_dir}&order=time&desc=1&showempty=0&page=1&num=1000&bdstoken={BDSTOKEN}"
+                f"{BASE_API}/api/list?{qp()}&dir={encoded_dir}&order=time&desc=1&showempty=0&page=1&num=1000&bdstoken={bdstoken}"
             )
             list_res = r_list.json()
             if list_res.get("errno") == 0:
@@ -708,7 +728,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                         "time": int(entry.get("server_mtime") or entry.get("ctime") or 0)
                     }
         except Exception as e:
-            print(f"[TeraBridge][WARN] Failed to list existing account files: {e}", flush=True)
+            logger.warning("Failed to list existing account files: %s", e)
 
     # Transfer requests mutate the same account/session. Serialising them
     # avoids triggering TeraBox verification when a shared folder is large.
@@ -722,7 +742,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
             existing_files,
             action,
             wait_for_transcoding,
-            BDSTOKEN,
+            bdstoken,
             quality
         ))
 
@@ -741,7 +761,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                 fsids_str = json.dumps(chunk)
                 encoded_fsids = urllib.parse.quote(fsids_str)
                 
-                metas_url = f"{BASE_API}/api/filemetas?{qp()}&fsids={encoded_fsids}&dlink=1&thumb=0&bdstoken={BDSTOKEN}"
+                metas_url = f"{BASE_API}/api/filemetas?{qp()}&fsids={encoded_fsids}&dlink=1&thumb=0&bdstoken={bdstoken}"
                 try:
                     mr = await get_session().get(metas_url, timeout=20.0)
                     metas_res = mr.json()
@@ -753,7 +773,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                         if entry_fs_id and entry_dlink:
                             dlink_map[entry_fs_id] = entry_dlink
                 except Exception as e:
-                    print(f"[ParallelResolve][ERROR] Batch filemetas request failed: {e}", flush=True)
+                    logger.error("Batch filemetas request failed: %s", e)
 
             # Map the resolved direct links back to results
             for r in results:
