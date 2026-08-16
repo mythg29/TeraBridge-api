@@ -1406,18 +1406,18 @@ async def stream_segment(request: Request):
     sig = request.query_params.get("sig") or ""
     exp = request.query_params.get("exp") or ""
     if not url:
-        return Response(content="Missing segment URL", status_code=400)
+        return JSONResponse({"status": "error", "message": "Missing required parameter 'url'."}, status_code=400)
 
     target_url = url
 
     if not (sig and verify_signature(target_url, "", "", sig, exp)) and not await check_auth(request):
-        return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
+        return JSONResponse({"status": "error", "message": "Unauthorized: Invalid signature or API key."}, status_code=401)
 
     # SSRF Protection
     try:
         parsed = urllib.parse.urlparse(target_url)
         if parsed.scheme not in ("http", "https"):
-            return Response(content="Forbidden: Unsupported URL scheme.", status_code=403)
+            return JSONResponse({"status": "error", "message": "Forbidden: Unsupported URL scheme."}, status_code=403)
         domain = parsed.hostname.lower() if parsed.hostname else ""
         allowed_suffixes = (
             ".1024terabox.com", ".terabox.com", ".teraboxapp.com", ".terabox.app", ".baidu.com",
@@ -1443,9 +1443,9 @@ async def stream_segment(request: Request):
 
         is_allowed = any(_host_allowed(domain, suffix) for suffix in allowed_suffixes)
         if not is_allowed:
-            return Response(content="Forbidden: Invalid stream host destination.", status_code=403)
+            return JSONResponse({"status": "error", "message": "Forbidden: Invalid stream host destination."}, status_code=403)
     except Exception:
-        return Response(content="Invalid segment URL format", status_code=400)
+        return JSONResponse({"status": "error", "message": "Invalid segment URL format."}, status_code=400)
 
     if REDIRECT_SEGMENTS:
         return RedirectResponse(url=target_url, status_code=307)
@@ -1486,7 +1486,7 @@ async def stream_segment(request: Request):
         return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
 
     except Exception as e:
-        return Response(content=f"Segment proxy encountered an error: {str(e)}", status_code=500)
+        return JSONResponse({"status": "error", "message": f"Segment proxy encountered an error: {str(e)}"}, status_code=500)
 
 @app.api_route("/api/thumbnail", methods=["GET", "OPTIONS"])
 @app.api_route("/api/stream/thumbnail", methods=["GET", "OPTIONS"])
@@ -1499,11 +1499,11 @@ async def stream_thumbnail(request: Request):
     exp = request.query_params.get("exp") or ""
 
     if not url and not (surl and fs_id):
-        return Response(content="Missing thumbnail URL or surl/fs_id parameters", status_code=400)
+        return JSONResponse({"status": "error", "message": "Missing required parameters: 'url' or 'surl' and 'fs_id'."}, status_code=400)
 
     if not url:
         if not (sig and verify_signature(surl, fs_id, size_type, sig, exp)) and not await check_auth(request):
-            return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
+            return JSONResponse({"status": "error", "message": "Unauthorized: Invalid signature or API key."}, status_code=401)
         
         share_url = f"https://1024terabox.com/s/{surl}"
         cached_res = cache.get(share_url, "l", False)
@@ -1513,10 +1513,10 @@ async def stream_thumbnail(request: Request):
                 if cached_res.get("errno") == 0:
                     cache.put(share_url, "l", False, cached_res)
             except Exception as e:
-                return Response(content=f"Failed to resolve thumbnail details: {str(e)}", status_code=500)
+                return JSONResponse({"status": "error", "message": f"Failed to resolve thumbnail details: {str(e)}"}, status_code=500)
 
         if cached_res.get("errno") != 0:
-            return Response(content="Failed to query share content.", status_code=400)
+            return JSONResponse({"status": "error", "message": "Failed to query share content."}, status_code=400)
 
         matching_file = None
         for f in cached_res.get("files", []):
@@ -1525,18 +1525,18 @@ async def stream_thumbnail(request: Request):
                 break
         
         if not matching_file or not matching_file.get("thumbnails"):
-            return Response(content="Thumbnail image not found", status_code=404)
+            return JSONResponse({"status": "error", "message": "Thumbnail image not found."}, status_code=404)
 
         url = matching_file["thumbnails"].get(size_type)
         if not url:
             url = next(iter(matching_file["thumbnails"].values()), None)
 
         if not url:
-            return Response(content="Thumbnail image not available", status_code=404)
+            return JSONResponse({"status": "error", "message": "Thumbnail image not available."}, status_code=404)
 
     else:
         if not (sig and verify_signature(url, "", "", sig, exp)) and not await check_auth(request):
-            return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
+            return JSONResponse({"status": "error", "message": "Unauthorized: Invalid signature or API key."}, status_code=401)
 
     client = _proxy_client
     try:
@@ -1565,7 +1565,7 @@ async def stream_thumbnail(request: Request):
         return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
 
     except Exception as e:
-        return Response(content=f"Thumbnail proxy encountered an error: {str(e)}", status_code=500)
+        return JSONResponse({"status": "error", "message": f"Thumbnail proxy encountered an error: {str(e)}"}, status_code=500)
 
 @app.api_route("/api/download", methods=["GET", "OPTIONS"])
 async def download_file_route(request: Request):
@@ -1575,10 +1575,10 @@ async def download_file_route(request: Request):
     exp = request.query_params.get("exp") or ""
 
     if not surl or not fs_id:
-        return Response(content="Missing required parameters: surl and fs_id", status_code=400)
+        return JSONResponse({"status": "error", "message": "Missing required parameters: 'surl' and 'fs_id'."}, status_code=400)
 
     if not (sig and verify_signature(surl, fs_id, "", sig, exp)) and not await check_auth(request):
-        return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
+        return JSONResponse({"status": "error", "message": "Unauthorized: Invalid signature or API key."}, status_code=401)
 
     share_url = f"https://1024terabox.com/s/{surl}"
     cached_res = cache.get(share_url, "d", False)
@@ -1590,10 +1590,10 @@ async def download_file_route(request: Request):
                 if not is_transcoding:
                     cache.put(share_url, "d", False, cached_res)
         except Exception as e:
-            return Response(content=f"Failed to resolve download details: {str(e)}", status_code=500)
+            return JSONResponse({"status": "error", "message": f"Failed to resolve download details: {str(e)}"}, status_code=500)
 
     if cached_res.get("errno") != 0:
-        return Response(content=f"Failed to resolve share link: {cached_res.get('error', 'Unknown error')}", status_code=400)
+        return JSONResponse({"status": "error", "message": cached_res.get("error", "Failed to resolve share link.")}, status_code=400)
 
     target_file = None
     for f in cached_res.get("files", []):
@@ -1602,16 +1602,16 @@ async def download_file_route(request: Request):
             break
 
     if not target_file:
-        return Response(content="File not found in share link", status_code=404)
+        return JSONResponse({"status": "error", "message": "File not found in share link."}, status_code=404)
 
     if target_file.get("error"):
-        return Response(content=f"File resolution error: {target_file.get('error')}", status_code=400)
+        return JSONResponse({"status": "error", "message": f"File resolution error: {target_file.get('error')}"}, status_code=400)
 
     dlink = target_file.get("dlink")
     filename = target_file.get("filename") or "download"
 
     if not dlink:
-        return Response(content="Download link not available for this file", status_code=404)
+        return JSONResponse({"status": "error", "message": "Download link not available for this file."}, status_code=404)
 
     client = _proxy_client
     try:
@@ -1653,15 +1653,15 @@ async def download_file_route(request: Request):
         return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
 
     except Exception as e:
-        return Response(content=f"Download proxy encountered an error: {str(e)}", status_code=500)
+        return JSONResponse({"status": "error", "message": f"Download proxy encountered an error: {str(e)}"}, status_code=500)
 
 @app.get("/api/debug_curl")
 async def debug_curl(request: Request):
     if not await check_admin(request):
-        return Response(content="Unauthorized", status_code=401)
+        return JSONResponse({"status": "error", "message": "Unauthorized: Admin API key required."}, status_code=401)
     url = request.query_params.get("url")
     if not url:
-        return Response(content="Missing url", status_code=400)
+        return JSONResponse({"status": "error", "message": "Missing required parameter 'url'."}, status_code=400)
     try:
         import httpx
         async with httpx.AsyncClient(timeout=15.0, http2=True) as client:
@@ -1671,12 +1671,13 @@ async def debug_curl(request: Request):
             except Exception:
                 body = req.text[:2000]
             return {
+                "status": "success",
                 "status_code": req.status_code,
                 "headers": dict(req.headers),
                 "body": body
             }
     except Exception as e:
-        return Response(content=str(e), status_code=500)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 # ─── Dynamic Config Sync ─────────────────────────────────────────────
 _current_active_account_id = None
