@@ -30,7 +30,7 @@ if not logger.handlers:
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
 
 BASE_PUBLIC = "https://www.terabox.com"
-BASE_API = "https://www.1024terabox.com"
+BASE_API = "https://dm.1024terabox.com"
 
 # Credentials must be supplied via the environment or account pool.  TeraBox
 # binds tokens to a session, so source-code fallbacks are both unsafe and stale.
