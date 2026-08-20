@@ -99,7 +99,12 @@ async def resolve_tokens_from_cookie(cookie_str):
     resolved = {}
     
     try:
-        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0) as temp_client:
+        async with httpx.AsyncClient(
+    headers=HEADERS,
+    cookies=temp_cookies,
+    timeout=15.0,
+    follow_redirects=True
+) as temp_client:
             r = await temp_client.get(f"{BASE_API}/main")
             if r.status_code != 200:
                 raise Exception(f"TeraBox returned HTTP {r.status_code}")
